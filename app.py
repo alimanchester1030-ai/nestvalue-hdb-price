@@ -1,11 +1,13 @@
 """
 NestValue — HDB Resale Price Estimator
 Streamlit deployment for the MLDP (CAI2C08) project.
+Proof-of-concept scoped to 4 towns: Ang Mo Kio, Clementi, Woodlands, Serangoon.
 """
 
 import datetime
 import joblib
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 
 # ----------------------------------------------------------------------
@@ -53,6 +55,7 @@ st.markdown(
     }
     .stButton>button:hover { background-color: #14806A; color: white; }
     .footnote { color: #9CA3AF; font-size: 12px; margin-top: 30px; text-align: center; }
+    .scope-note { background: #FFF8E6; border: 1px solid #F0DDA0; border-radius: 10px; padding: 10px 14px; font-size: 13px; color: #7A5C00; margin-bottom: 18px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -64,6 +67,17 @@ st.markdown(
         <h1>🏠 NestValue</h1>
         <p>Instant, data-driven HDB resale price estimates — powered by a machine learning model
         trained on real Singapore resale transactions (2017 onwards).</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="scope-note">
+    📍 <b>Proof-of-concept scope:</b> this version covers 4 towns — Ang Mo Kio, Clementi, Woodlands,
+    and Serangoon — chosen to represent different regions and a mix of mature and newer estates.
+    A production version would extend the same approach to all towns.
     </div>
     """,
     unsafe_allow_html=True,
@@ -88,8 +102,10 @@ except Exception as e:
 
 if load_error:
     st.error(
-        "⚠️ The prediction model could not be loaded. Please make sure "
-        "`hdb_price_model.pkl` and `town_psm_median.pkl` are in the same folder as this app."
+        "⚠️ The prediction model could not be loaded. This is usually caused by a "
+        "scikit-learn version mismatch between training and deployment. Please make sure "
+        "`requirements.txt` pins the exact scikit-learn version used to train the model, "
+        "and that `hdb_price_model.pkl` / `town_psm_median.pkl` are in the same folder as this app."
     )
     st.caption(f"Technical details: {load_error}")
     st.stop()
@@ -110,7 +126,8 @@ st.subheader("Tell us about the flat")
 
 col1, col2 = st.columns(2)
 with col1:
-    town = st.selectbox("Town", TOWNS, index=TOWNS.index("TAMPINES") if "TAMPINES" in TOWNS else 0)
+    default_town_idx = TOWNS.index("CLEMENTI") if "CLEMENTI" in TOWNS else 0
+    town = st.selectbox("Town", TOWNS, index=default_town_idx)
     flat_type = st.selectbox("Flat Type", FLAT_TYPES, index=FLAT_TYPES.index("4 ROOM"))
     flat_model = st.selectbox("Flat Model", FLAT_MODELS, index=FLAT_MODELS.index("Model A"))
 
@@ -133,8 +150,9 @@ with st.expander("ℹ️ Derived values used by the model"):
 st.markdown("---")
 predict_clicked = st.button("🔍 Estimate Resale Price")
 
+
 # ----------------------------------------------------------------------
-# Validation + Prediction
+# Validation + Prediction helpers
 # ----------------------------------------------------------------------
 def validate_inputs():
     errors = []
@@ -147,6 +165,24 @@ def validate_inputs():
     return errors
 
 
+def build_input_row(selected_town):
+    row = pd.DataFrame([{
+        "town": selected_town,
+        "flat_type": flat_type,
+        "floor_area_sqm": float(floor_area_sqm),
+        "flat_model": flat_model,
+        "lease_commence_date": lease_commence_date,
+        "remaining_lease_years": remaining_lease_years,
+        "storey_mid": float(storey_mid),
+        "transaction_year": current_year,
+        "flat_age": flat_age,
+    }])
+    row["town_psm_median"] = row["town"].map(town_psm_median)
+    if row["town_psm_median"].isna().any():
+        row["town_psm_median"] = town_psm_median.median()
+    return row
+
+
 if "last_prediction" not in st.session_state:
     st.session_state.last_prediction = None
 
@@ -157,27 +193,21 @@ if predict_clicked:
             st.warning(f"⚠️ {e}")
     else:
         try:
-            new_flat = pd.DataFrame([{
-                "town": town,
-                "flat_type": flat_type,
-                "floor_area_sqm": float(floor_area_sqm),
-                "flat_model": flat_model,
-                "lease_commence_date": lease_commence_date,
-                "remaining_lease_years": remaining_lease_years,
-                "storey_mid": float(storey_mid),
-                "transaction_year": current_year,
-                "flat_age": flat_age,
-            }])
-            new_flat["town_psm_median"] = new_flat["town"].map(town_psm_median)
-            if new_flat["town_psm_median"].isna().any():
-                new_flat["town_psm_median"] = town_psm_median.median()
-
+            new_flat = build_input_row(town)
             prediction = model.predict(new_flat)[0]
+
+            # Also predict the same flat spec across all 4 towns, for comparison
+            town_predictions = {}
+            for t in TOWNS:
+                row = build_input_row(t)
+                town_predictions[t] = model.predict(row)[0]
+
             st.session_state.last_prediction = {
                 "price": prediction,
                 "town": town,
                 "flat_type": flat_type,
                 "floor_area_sqm": floor_area_sqm,
+                "town_predictions": town_predictions,
             }
         except Exception as e:
             st.error("⚠️ Something went wrong while generating the estimate. Please try different inputs.")
@@ -200,15 +230,34 @@ if st.session_state.last_prediction:
     )
     price_per_sqm = pred["price"] / pred["floor_area_sqm"]
     st.caption(f"≈ S$ {price_per_sqm:,.0f} per sqm — for comparison against similar listings.")
+
+    # --- Town comparison chart ---
+    st.markdown("#### How does this flat's price compare across towns?")
+    st.caption("Same flat type, floor area, storey, and lease — only the town changes.")
+
+    town_preds = pred["town_predictions"]
+    towns_sorted = sorted(town_preds.items(), key=lambda x: x[1])
+    labels = [t.title() for t, _ in towns_sorted]
+    values = [v for _, v in towns_sorted]
+    colors = ["#0F5C4F" if t.upper() == pred["town"] else "#B5C9C4" for t, _ in towns_sorted]
+
+    fig, ax = plt.subplots(figsize=(6, 3.2))
+    bars = ax.barh(labels, values, color=colors)
+    ax.set_xlabel("Estimated Price (SGD)")
+    ax.bar_label(bars, labels=[f"${v:,.0f}" for v in values], padding=3, fontsize=8)
+    ax.spines[['top', 'right']].set_visible(False)
+    fig.tight_layout()
+    st.pyplot(fig)
+
 else:
     st.info("👆 Fill in the flat details above and click **Estimate Resale Price** to see a prediction.")
 
 st.markdown(
     """
     <div class="footnote">
-    NestValue is a student project prototype for CAI2C08 (Machine Learning for Developers).
-    Estimates are based on a Random Forest model trained on HDB resale transactions (Jan 2017 onwards, data.gov.sg)
-    and should not be relied on for actual property transactions.
+    NestValue is a student project prototype for CAI2C08 (Machine Learning for Developers), scoped to
+    4 towns as a proof-of-concept. Estimates are based on a Random Forest model trained on HDB resale
+    transactions (Jan 2017 onwards, data.gov.sg) and should not be relied on for actual property transactions.
     </div>
     """,
     unsafe_allow_html=True,
